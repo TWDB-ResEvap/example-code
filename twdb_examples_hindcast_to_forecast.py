@@ -57,6 +57,29 @@ def _clamp_dates(start_date: str, end_date: str, available: list[str]) -> tuple[
     return clamped_start, clamped_end
 
 
+def _normalize_res_name(df: pd.DataFrame) -> pd.DataFrame:
+    """Unwrap RES_NAME values returned as lists (e.g. ["CANYON LAKE"]) into strings.
+
+    One-item lists become plain strings. Lists with more than one item are
+    exploded into one row per reservoir.
+    """
+    if df.empty or "RES_NAME" not in df.columns:
+        return df
+
+    is_list = df["RES_NAME"].map(lambda v: isinstance(v, (list, tuple)))
+    if not is_list.any():
+        return df
+
+    lengths = df["RES_NAME"].map(lambda v: len(v) if isinstance(v, (list, tuple)) else 1)
+    if (lengths == 1).all():
+        df["RES_NAME"] = df["RES_NAME"].map(
+            lambda v: v[0] if isinstance(v, (list, tuple)) else v
+        )
+    else:
+        df = df.explode("RES_NAME", ignore_index=True)
+    return df
+
+
 def get_historical(
     reservoir_names: list[str] | str,
     datasets_variables: dict[str, list[str] | str],
@@ -66,10 +89,9 @@ def get_historical(
 ) -> pd.DataFrame:
     """
     Fetch historical daily timeseries for one or more reservoirs.
-
     Dates are automatically clamped to the available historical range with a warning.
     One API call is made per (dataset, variable) pair; results are merged on
-    (start_date, RES_NAME).
+    (date, RES_NAME).
 
     Parameters
     ----------
@@ -83,7 +105,7 @@ def get_historical(
 
     Returns
     -------
-    pd.DataFrame with columns: start_date, RES_NAME, <variable columns ...>
+    pd.DataFrame with columns: date, RES_NAME, <variable columns ...>
     """
     if isinstance(reservoir_names, str):
         reservoir_names = [reservoir_names]
@@ -94,6 +116,8 @@ def get_historical(
 
     merge_keys = ["date", "RES_NAME"]
     frames = []
+    seen_cols = set(merge_keys)
+
     for dataset, variables in datasets_variables.items():
         if isinstance(variables, str):
             variables = [variables]
@@ -112,11 +136,17 @@ def get_historical(
                 },
             )
             df = pd.DataFrame(r.json())
+            if df.empty:
+                continue  # nothing returned for this dataset/variable
 
+            df = _normalize_res_name(df)  # <-- the fix: make merge keys hashable
             df["date"] = pd.to_datetime(df["date"])
-            drop = [
-                c for c in df.columns if c not in merge_keys and c in frames[0].columns] if frames else []
-            frames.append(df.drop(columns=drop))
+
+            # Drop non-key columns already present in ANY earlier frame
+            drop = [c for c in df.columns if c in seen_cols and c not in merge_keys]
+            df = df.drop(columns=drop)
+            seen_cols.update(df.columns)
+            frames.append(df)
 
     if not frames:
         return pd.DataFrame()
@@ -124,7 +154,6 @@ def get_historical(
     merged = frames[0]
     for df in frames[1:]:
         merged = merged.merge(df, on=merge_keys, how="outer")
-
     return merged.sort_values(merge_keys).reset_index(drop=True)
 
 
@@ -182,9 +211,11 @@ def get_forecast(
         },
     )
     df = pd.DataFrame(r.json())
+    if df.empty:
+        return df
+    df = _normalize_res_name(df)
     df["date"] = pd.to_datetime(df["date"])
     return df.sort_values(["date", "RES_NAME"]).reset_index(drop=True)
-
 
 # %% Plot historical + forecast for a single reservoir
 # --- inputs ---
@@ -195,7 +226,7 @@ fcast_datasets_variables = {"lem": ["E_hs"]}
 
 # plot available historical estimates
 hist_start =(today + datetime.timedelta(days=-14)).strftime("%Y-%m-%d")
-hist_end = (today + datetime.timedelta(days=-4)).strftime("%Y-%m-%d")
+hist_end = (today + datetime.timedelta(days=-3)).strftime("%Y-%m-%d")
 
 #get forecast data plus plast forecast data to include 3 days between hist and current fcast
 fcast_start = (today + datetime.timedelta(days=-3)).strftime("%Y-%m-%d")
@@ -215,7 +246,7 @@ plt.plot(fcast["date"],       fcast["E_hs ensemble_mean (mm)"], linewidth=2.5,
          c="Violet", label="E_hs Forecast mean")
 
 #Connect historical and forecast time series
-plt.plot([hist["date"].iloc[-1], fcast["date"].iloc[0]], [hist["E_hs (mm)"].iloc[-1], fcast["E_hs ensemble_mean (mm)"].iloc[0]], color='black')
+plt.plot([hist["date"].iloc[-1], fcast["date"].iloc[0]], [hist["E_hs (mm)"].iloc[-1], fcast["E_hs ensemble_mean (mm)"].iloc[0]], color='grey', linestyle = '--')
 
 # Shaded Area: 10th - 90th (Lighter)
 plt.fill_between(fcast.date, fcast["E_hs ensemble_p10 (mm)"], fcast["E_hs ensemble_p90 (mm)"], color='blue', alpha=0.2, label='10th-90th Percentile')
